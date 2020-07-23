@@ -1,0 +1,412 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Spottedleaf <spottedleaf@spottedleaf.dev>
+Date: Thu, 23 Jul 2020 15:21:48 -0700
+Subject: [PATCH] Fix light engine prioritisation
+
+Last-ditch effort to fix this system without rewriting it all
+
+diff --git a/src/main/java/com/tuinity/tuinity/chunk/light/LightQueue.java b/src/main/java/com/tuinity/tuinity/chunk/light/LightQueue.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..46fb800d676840c7379eeccaa8e42820548b758d
+--- /dev/null
++++ b/src/main/java/com/tuinity/tuinity/chunk/light/LightQueue.java
+@@ -0,0 +1,216 @@
++package com.tuinity.tuinity.chunk.light;
++
++import com.destroystokyo.paper.util.math.IntegerUtil;
++import com.destroystokyo.paper.util.pooled.PooledObjects;
++import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
++import it.unimi.dsi.fastutil.longs.LongLinkedOpenHashSet;
++import java.util.ArrayDeque;
++import java.util.ArrayList;
++import java.util.List;
++
++public abstract class LightQueue {
++
++    protected final PrioritisedCoordinateQueue queue = new PrioritisedCoordinateQueue();
++
++    public abstract void executeLevelUpdate();
++    public abstract boolean needsLevelUpdate();
++
++    protected final ArrayList<Runnable> cachedPreUpdates = new ArrayList<>();
++    protected final ArrayList<Runnable> cachedPostUpdates = new ArrayList<>();
++
++    protected final void getTasks(final int levelUpdateBatchSize) {
++        this.queue.pollTasks(this.cachedPreUpdates, this.cachedPostUpdates, levelUpdateBatchSize);
++    }
++
++    public boolean isEmpty() {
++        return this.queue.isEmpty();
++    }
++
++    public void setPriority(final long coordinate, final int to) {
++        this.queue.setPriority(coordinate, to);
++    }
++
++    public void queueUpdate(final long coordinate, final Runnable preUpdate, final Runnable postUpdate,
++                            final int minPriority) {
++        this.queue.queueUpdate(coordinate, preUpdate, postUpdate, minPriority);
++    }
++
++    // only designed to have one thread executing tasks
++    public void executeTasks(final int levelUpdateBatchSize, final int totalLevelUpdates) {
++        for (int i = 0; i < totalLevelUpdates; ++i) {
++            this.getTasks(levelUpdateBatchSize);
++
++            for (int k = 0, len = this.cachedPreUpdates.size(); k < len; ++k) {
++                this.cachedPreUpdates.get(k).run();
++            }
++
++            this.executeLevelUpdate();
++
++
++            for (int k = 0, len = this.cachedPostUpdates.size(); k < len; ++k) {
++                this.cachedPostUpdates.get(k).run();
++            }
++
++            final boolean hasMoreQueuedTasks = (this.cachedPostUpdates.size() | this.cachedPreUpdates.size()) != 0 || this.needsLevelUpdate();
++            this.cachedPreUpdates.clear();
++            this.cachedPostUpdates.clear();
++
++            if (!hasMoreQueuedTasks) {
++                return;
++            }
++        }
++    }
++
++    protected static final class PrioritisedCoordinateQueue {
++
++        protected final Long2ObjectOpenHashMap<ChunkLightTasks> lightTasksByCoordinate = new Long2ObjectOpenHashMap<>(512, 0.7f);
++        protected long nonEmptyQueues = 0L;
++
++        // lower is higher
++        protected final LongLinkedOpenHashSet[] queuedChunks = new LongLinkedOpenHashSet[64];
++
++        {
++            for (int i = 0; i < this.queuedChunks.length; ++i) {
++                this.queuedChunks[i] = new LongLinkedOpenHashSet(64, 0.7f);
++            }
++        }
++
++        public synchronized boolean isEmpty() {
++            return this.nonEmptyQueues == 0L;
++        }
++
++        public synchronized void queueUpdate(final long coordinate, final Runnable preUpdate, final Runnable postUpdate,
++                                             final int minPriority) {
++            if (preUpdate == postUpdate && preUpdate == null) {
++                throw new IllegalArgumentException("Must supply an update");
++            }
++
++            final ChunkLightTasks group = this.lightTasksByCoordinate.computeIfAbsent(coordinate, (final long keyInMap) -> {
++                return new ChunkLightTasks();
++            });
++
++            if (preUpdate != null) {
++                group.preUpdates.add(preUpdate);
++            }
++            if (postUpdate != null) {
++                group.postUpdates.add(postUpdate);
++            }
++
++            if (group.currentPriority == -1) {
++                group.currentPriority = minPriority;
++                this.queuedChunks[minPriority].add(coordinate);
++                this.nonEmptyQueues |= (1L << minPriority);
++            } else if (group.currentPriority > minPriority) {
++                final LongLinkedOpenHashSet oldQueue = this.queuedChunks[group.currentPriority];
++                oldQueue.remove(coordinate);
++                if (oldQueue.isEmpty()) {
++                    this.nonEmptyQueues ^= (1L << group.currentPriority);
++                }
++
++                group.currentPriority = minPriority;
++                this.queuedChunks[minPriority].add(coordinate);
++                this.nonEmptyQueues |= (1L << minPriority);
++            }
++        }
++
++        public synchronized void raisePriority(final long coordinate, final int minPriority) {
++            final ChunkLightTasks group = this.lightTasksByCoordinate.get(coordinate);
++            if (group == null) {
++                return;
++            }
++
++            final int currentPriority = group.currentPriority;
++
++            if (currentPriority <= minPriority) {
++                return;
++            }
++
++            final LongLinkedOpenHashSet oldQueue = this.queuedChunks[group.currentPriority];
++            oldQueue.remove(coordinate);
++            if (oldQueue.isEmpty()) {
++                this.nonEmptyQueues &= ~(1L << currentPriority);
++            }
++
++            this.queuedChunks[minPriority].add(coordinate);
++            this.nonEmptyQueues |= (1L << minPriority);
++            group.currentPriority = minPriority;
++        }
++
++        public synchronized void setPriority(final long coordinate, final int priority) {
++            final ChunkLightTasks group = this.lightTasksByCoordinate.get(coordinate);
++            if (group == null) {
++                return;
++            }
++
++            final int currentPriority = group.currentPriority;
++
++            if (currentPriority == priority) {
++                return;
++            }
++
++            final LongLinkedOpenHashSet oldQueue = this.queuedChunks[group.currentPriority];
++            oldQueue.remove(coordinate);
++            if (oldQueue.isEmpty()) {
++                this.nonEmptyQueues &= ~(1L << currentPriority);
++            }
++
++            this.queuedChunks[priority].add(coordinate);
++            this.nonEmptyQueues |= (1L << priority);
++            group.currentPriority = priority;
++        }
++
++        public synchronized void pollTasks(final List<Runnable> preUpdates, final List<Runnable> postUpdates, final int maxTasks) {
++            int preTasks = 0;
++            int postTasks = 0;
++
++            while (this.nonEmptyQueues != 0L) {
++                final int queueIndex = (int)IntegerUtil.trailingZeros(this.nonEmptyQueues);
++                final LongLinkedOpenHashSet queue = this.queuedChunks[queueIndex];
++
++                while (!queue.isEmpty()) {
++                    final long coordinate = queue.firstLong();
++                    final ChunkLightTasks tasks = this.lightTasksByCoordinate.get(coordinate);
++
++                    int preTasksPulled = 0;
++
++                    for (int i = 0, len = Math.min(maxTasks - preTasks, tasks.preUpdates.size()); i < len; ++i) {
++                        preUpdates.add(tasks.preUpdates.poll());
++                        ++preTasks;
++                        ++preTasksPulled;
++                    }
++
++                    // make sure that for every pre task pulled we also try to pull a post task
++                    for (int i = 0, len = Math.min(Math.max(maxTasks - postTasks, preTasksPulled), tasks.postUpdates.size()); i < len; ++i) {
++                        postUpdates.add(tasks.postUpdates.poll());
++                        ++postTasks;
++                    }
++
++                    if (tasks.preUpdates.isEmpty() && tasks.postUpdates.isEmpty()) {
++                        this.lightTasksByCoordinate.remove(coordinate);
++                        queue.removeFirstLong();
++                        if (queue.isEmpty()) {
++                            this.nonEmptyQueues ^= (1L << queueIndex);
++                        }
++                        ChunkLightTasks.POOLED_QUEUES.release(tasks.preUpdates);
++                        ChunkLightTasks.POOLED_QUEUES.release(tasks.postUpdates);
++                    }
++
++                    if (preTasks >= maxTasks || postTasks >= maxTasks) {
++                        return;
++                    }
++                }
++            }
++        }
++
++        protected static final class ChunkLightTasks {
++
++            protected static final PooledObjects<ArrayDeque<Runnable>> POOLED_QUEUES = new PooledObjects<>(ArrayDeque::new, 4096, ArrayDeque::clear);
++
++            protected int currentPriority = -1;
++
++            protected final ArrayDeque<Runnable> preUpdates = POOLED_QUEUES.acquire();
++            protected final ArrayDeque<Runnable> postUpdates = POOLED_QUEUES.acquire();
++
++        }
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/LightEngineThreaded.java b/src/main/java/net/minecraft/server/LightEngineThreaded.java
+index 721f86a5405c9575d8ee3fc661395e65487b6d96..587fe21099e43442d42c3d0a84701f9fcc0a02df 100644
+--- a/src/main/java/net/minecraft/server/LightEngineThreaded.java
++++ b/src/main/java/net/minecraft/server/LightEngineThreaded.java
+@@ -13,22 +13,27 @@ import org.apache.logging.log4j.Logger;
+ 
+ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+ 
++    // Tuinity start - prioritise light better
++    protected final com.tuinity.tuinity.chunk.light.LightQueue lightQueue = new com.tuinity.tuinity.chunk.light.LightQueue() {
++        @Override
++        public void executeLevelUpdate() {
++            LightEngineThreaded.super.a(Integer.MAX_VALUE, true, true);
++        }
++
++        @Override
++        public boolean needsLevelUpdate() {
++            return LightEngineThreaded.super.a();
++        }
++    };
++    // Tuinity end - prioritise light better
++
+     private static final Logger LOGGER = LogManager.getLogger();
+     private final ThreadedMailbox<Runnable> b; ThreadedMailbox<Runnable> mailbox; // Paper
+     // Paper start
+     private static final int MAX_PRIORITIES = PlayerChunkMap.GOLDEN_TICKET + 2;
+ 
+     public void changePriority(long pair, int currentPriority, int priority) {
+-        this.mailbox.queue(() -> {
+-            ChunkLightQueue remove = this.queue.buckets[currentPriority].remove(pair);
+-            if (remove != null) {
+-                ChunkLightQueue existing = this.queue.buckets[priority].put(pair, remove);
+-                if (existing != null) {
+-                    remove.pre.addAll(existing.pre);
+-                    remove.post.addAll(existing.post);
+-                }
+-            }
+-        });
++        this.lightQueue.setPriority(pair, priority); // Tuinity - prioritise light better
+     }
+ 
+     static class ChunkLightQueue {
+@@ -104,7 +109,7 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+         }
+     }
+ 
+-    private final LightQueue queue = new LightQueue();
++    //private final LightQueue queue = new LightQueue(); // Tuinity - replaced
+     // Paper end
+     private final PlayerChunkMap d;
+     private final Mailbox<ChunkTaskQueueSorter.a<Runnable>> e;
+@@ -143,7 +148,7 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+ 
+     protected void a(ChunkCoordIntPair chunkcoordintpair) {
+         this.a(chunkcoordintpair.x, chunkcoordintpair.z, () -> {
+-            return 0;
++            return 45;
+         }, LightEngineThreaded.Update.PRE_UPDATE, SystemUtils.a(() -> {
+             super.b(chunkcoordintpair, false);
+             super.a(chunkcoordintpair, false);
+@@ -167,7 +172,7 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+     @Override
+     public void a(SectionPosition sectionposition, boolean flag) {
+         this.a(sectionposition.a(), sectionposition.c(), () -> {
+-            return 0;
++            return 45;
+         }, LightEngineThreaded.Update.PRE_UPDATE, SystemUtils.a(() -> {
+             super.a(sectionposition, flag);
+         }, () -> {
+@@ -187,7 +192,7 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+     @Override
+     public void a(EnumSkyBlock enumskyblock, SectionPosition sectionposition, @Nullable NibbleArray nibblearray, boolean flag) {
+         this.a(sectionposition.a(), sectionposition.c(), () -> {
+-            return 0;
++            return 45;
+         }, LightEngineThreaded.Update.PRE_UPDATE, SystemUtils.a(() -> {
+             super.a(enumskyblock, sectionposition, nibblearray, flag);
+         }, () -> {
+@@ -196,26 +201,23 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+     }
+ 
+     private void a(int i, int j, LightEngineThreaded.Update lightenginethreaded_update, Runnable runnable) {
+-        this.a(i, j, this.d.c(ChunkCoordIntPair.pair(i, j)), lightenginethreaded_update, runnable);
++        this.a(i, j, () -> 45, lightenginethreaded_update, runnable);
+     }
+ 
+     private void a(int i, int j, IntSupplier intsupplier, LightEngineThreaded.Update lightenginethreaded_update, Runnable runnable) {
+-        this.e.a(ChunkTaskQueueSorter.a(() -> {
+-            // Paper start
+-            int priority = intsupplier.getAsInt();
+-            this.queue.add(ChunkCoordIntPair.pair(i, j), priority, lightenginethreaded_update, runnable); // Paper
+-            if (priority <= 25) { // don't auto kick off unless priority
+-                // Paper end
+-                this.b();
+-            }
+-
+-        }, ChunkCoordIntPair.pair(i, j), intsupplier));
++        int priority = intsupplier.getAsInt();
++        this.lightQueue.queueUpdate(ChunkCoordIntPair.pair(i, j),
++                lightenginethreaded_update == LightEngineThreaded.Update.PRE_UPDATE ? runnable : null,
++                lightenginethreaded_update == LightEngineThreaded.Update.POST_UPDATE ? runnable : null,
++                priority);
++            // Paper end
++        this.queueUpdate();
+     }
+ 
+     @Override
+     public void b(ChunkCoordIntPair chunkcoordintpair, boolean flag) {
+         this.a(chunkcoordintpair.x, chunkcoordintpair.z, () -> {
+-            return 0;
++            return 45;
+         }, LightEngineThreaded.Update.PRE_UPDATE, SystemUtils.a(() -> {
+             super.b(chunkcoordintpair, flag);
+         }, () -> {
+@@ -231,9 +233,9 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+         long pair = chunkcoordintpair.pair();
+         CompletableFuture<IChunkAccess> future = new CompletableFuture<>();
+         IntSupplier prioritySupplier = d.getPrioritySupplier(pair);
+-        this.e.a(ChunkTaskQueueSorter.a(() -> {
+-            this.queue.add(pair, prioritySupplier.getAsInt(), LightEngineThreaded.Update.PRE_UPDATE, SystemUtils.a(() -> {
+-                // Paper end
++        int priority = prioritySupplier.getAsInt();
++        this.lightQueue.queueUpdate(pair, SystemUtils.a(() -> {
++            // Paper end
+             ChunkSection[] achunksection = ichunkaccess.getSections();
+ 
+             for (int i = 0; i < 16; ++i) {
+@@ -255,22 +257,21 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+         }, () -> {
+             return "lightChunk " + chunkcoordintpair + " " + flag;
+             // Paper start  - merge the 2 together
+-        }));
+-
+-        this.queue.add(pair, prioritySupplier.getAsInt(), LightEngineThreaded.Update.POST_UPDATE, () -> {
++        }), () -> {
+             ichunkaccess.b(true);
+             super.b(chunkcoordintpair, false);
+             // Paper start
+             future.complete(ichunkaccess);
+-        });
+-            queueUpdate(); // run queue now
+-        }, pair, prioritySupplier));
++        }, priority);
++
++        // run queue now
++        this.queueUpdate();
+         return future;
+         // Paper end
+     }
+ 
+     public void queueUpdate() {
+-        if ((!this.queue.isEmpty() || super.a()) && this.g.compareAndSet(false, true)) { // Paper
++        if ((!this.lightQueue.isEmpty() || super.a()) && this.g.compareAndSet(false, true)) { // Paper
+             this.b.a((() -> { // Paper - decompile error
+                 this.b();
+                 this.g.set(false);
+@@ -280,25 +281,8 @@ public class LightEngineThreaded extends LightEngine implements AutoCloseable {
+ 
+     }
+ 
+-    // Paper start - replace impl
+-    private final java.util.List<Runnable> pre = new java.util.ArrayList<>();
+-    private final java.util.List<Runnable> post = new java.util.ArrayList<>();
+     private void b() {
+-        int i = Math.min(queue.size(), 4);
+-        boolean ran = false;
+-        while (i-- > 0 && queue.poll(pre, post)) {
+-            pre.forEach(Runnable::run);
+-            pre.clear();
+-            super.a(Integer.MAX_VALUE, true, true);
+-            post.forEach(Runnable::run);
+-            post.clear();
+-            ran = true;
+-        }
+-        if (!ran) {
+-            // might have level updates to go still
+-            super.a(Integer.MAX_VALUE, true, true);
+-        }
+-        // Paper end
++        this.lightQueue.executeTasks(5, 4); // Tuinity - replace implementation
+     }
+ 
+     public void a(int i) {
